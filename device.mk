@@ -24,3 +24,6 @@ PRODUCT_DEFAULT_PROPERTY_OVERRIDES += \
     ro.treble.enabled=true \
     ro.build.characteristics=tablet \
     ro.product.first_api_level=28
+
+PRODUCT_SOONG_NAMESPACES += \
+    $(LOCAL_PATH)
