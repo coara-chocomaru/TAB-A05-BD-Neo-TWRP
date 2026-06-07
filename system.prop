@@ -11,6 +11,5 @@ ro.boot.hardware=mt8168
 ro.board.platform=mt8168
 ro.mediatek.chip_ver=S01
 ro.mediatek.platform=MT8168
-ro.mount.fs=EXT4
 ro.crypto.volume.filenames_mode=aes-256-cts
 gsm.current.phone-type=1
