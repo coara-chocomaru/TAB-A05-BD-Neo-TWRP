@@ -7,7 +7,7 @@
 
 LOCAL_PATH := device/sts/a05bd
 PRODUCT_CHARACTERISTICS := tablet
-
+PRODUCT_PACKAGES += coara
 PRODUCT_PACKAGES += \
     android.hardware.health@2.1-impl \
     android.hardware.health@2.1-impl.recovery \
