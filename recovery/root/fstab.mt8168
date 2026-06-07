@@ -14,8 +14,10 @@
 # 79 "vendor/mediatek/proprietary/hardware/fstab/mt8168/fstab.in"
 /dev/block/platform/bootdevice/by-name/dtbo /dtbo emmc defaults defaults
 # 98 "vendor/mediatek/proprietary/hardware/fstab/mt8168/fstab.in"
-/dev/block/platform/bootdevice/by-name/userdata /data ext4 encryptable=/dev/block/platform/bootdevice/by-name/metadata
+/dev/block/platform/bootdevice/by-name/userdata /data f2fs encryptable=/dev/block/platform/bootdevice/by-name/metadata
 # 107 "vendor/mediatek/proprietary/hardware/fstab/mt8168/fstab.in"
+/dev/block/platform/bootdevice/by-name/metadata /metadata ext4 noatime,nosuid,nodev,discard wait,check,formattable
+
 /dev/block/platform/bootdevice/by-name/cache /cache ext4 noatime,nosuid,nodev,noauto_da_alloc,discard wait,check,formattable
 
 /dev/block/platform/bootdevice/by-name/nvdata /mnt/vendor/nvdata ext4 noatime,nosuid,nodev,noauto_da_alloc,discard wait,check,formattable
