@@ -187,7 +187,7 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           lunch ${{ env.MAKEFILE_NAME }}-eng
           make clean
-          make coara -j$(nproc --all)
+          make ubuntu-loader -j$(nproc --all)
           make ${{ env.BUILD_TARGET }}image -j$(nproc --all)
 
       - name: Upload to Release
