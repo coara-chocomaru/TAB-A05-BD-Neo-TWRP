@@ -19,6 +19,8 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
@@ -43,7 +45,7 @@
 static const char *kDefaultRootfs = "/data/ubuntu";
 static const char *kDefaultFramebuffer = "/dev/graphics/fb0";
 static const char *kDefaultInputDirectory = "/dev/input";
-static const char *kVersion = "1.5.1-a05bd";
+static const char *kVersion = "1.6.3-a05bd";
 static const int kFontWidth = 8;
 static const int kFontHeight = 16;
 static const int kFontScale = 2;
@@ -63,9 +65,11 @@ struct MountState {
     bool proc;
     bool sys;
     bool devpts;
+    bool shm;
 };
 
-static MountState gMounts = {false, false, false, false};
+static MountState gMounts = {false, false, false, false, false};
+static bool gCreatedShmMountpoint = false;
 
 static const unsigned char kFont[95][16] = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
@@ -505,6 +509,24 @@ static bool setup_mounts(const char *root) {
         return false;
     }
     gMounts.dev = true;
+    char shm[PATH_MAX];
+    if (!make_path(shm, sizeof(shm), root, "dev/shm")) {
+        fprintf(stderr, "[ubuntu-loader] /dev/shm path too long\n");
+        return false;
+    }
+    if (!is_directory(shm)) {
+        if (mkdir(shm, 01777) != 0 && errno != EEXIST) {
+            print_error("create /dev/shm", shm);
+            return false;
+        }
+        gCreatedShmMountpoint = true;
+    }
+    if (!mount_one("tmpfs", shm, "tmpfs",
+                   MS_NOSUID | MS_NODEV,
+                   "mode=1777,size=128m", "mount /dev/shm")) {
+        return false;
+    }
+    gMounts.shm = true;
     if (!mount_one("proc", proc, "proc",
                    MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY,
                    NULL, "mount proc")) {
@@ -560,6 +582,17 @@ static bool unmount_if_present(const char *path, const char *label) {
 
 static bool cleanup_mounts(const char *root) {
     bool result = true;
+    if (!unmount_one(root, "dev/shm", &gMounts.shm)) result = false;
+    if (gCreatedShmMountpoint) {
+        char rootShm[PATH_MAX];
+        if (make_path(rootShm, sizeof(rootShm), root, "dev/shm")) {
+            if (rmdir(rootShm) != 0 && errno != ENOENT) {
+                print_error("remove temporary /dev/shm", rootShm);
+                result = false;
+            }
+        }
+        gCreatedShmMountpoint = false;
+    }
     char rootDevPts[PATH_MAX];
     if (!make_path(rootDevPts, sizeof(rootDevPts), root, "dev/pts")) {
         fprintf(stderr, "[ubuntu-loader] Unmount path too long: %s\n", "dev/pts");
@@ -782,23 +815,34 @@ struct Framebuffer {
     int rotation;
     int bytesPerPixel;
     bool ready;
+    char devicePath[PATH_MAX];
 
     Framebuffer() : fd(-1), memory(NULL), length(0), backup(NULL),
                     width(0), height(0), rawWidth(0), rawHeight(0),
                     rotation(0), bytesPerPixel(0), ready(false) {
         memset(&fixed, 0, sizeof(fixed));
         memset(&variable, 0, sizeof(variable));
+        memset(devicePath, 0, sizeof(devicePath));
     }
 
     bool open_device(const char *requested, bool preserveSnapshot = true) {
-        fd = open(requested, O_RDWR | O_CLOEXEC);
+        const char *actualPath = requested;
+        fd = open(actualPath, O_RDWR | O_CLOEXEC);
         if (fd < 0 && strcmp(requested, "/dev/graphics/fb0") == 0) {
-            fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+            actualPath = "/dev/fb0";
+            fd = open(actualPath, O_RDWR | O_CLOEXEC);
         }
         if (fd < 0) {
             print_error("open framebuffer", requested);
             return false;
         }
+        if (strlen(actualPath) + 1 > sizeof(devicePath)) {
+            fprintf(stderr, "[ubuntu-loader] Framebuffer device path too long\n");
+            close(fd);
+            fd = -1;
+            return false;
+        }
+        strcpy(devicePath, actualPath);
         if (ioctl(fd, FBIOGET_FSCREENINFO, &fixed) != 0 ||
             ioctl(fd, FBIOGET_VSCREENINFO, &variable) != 0) {
             print_error("query framebuffer", requested);
@@ -806,7 +850,7 @@ struct Framebuffer {
         }
         if (fixed.type != FB_TYPE_PACKED_PIXELS ||
             fixed.visual != FB_VISUAL_TRUECOLOR ||
-            (variable.bits_per_pixel != 16 && variable.bits_per_pixel != 32) ||
+            (variable.bits_per_pixel != 16 && variable.bits_per_pixel != 24 && variable.bits_per_pixel != 32) ||
             variable.xres == 0 || variable.yres == 0 ||
             fixed.line_length == 0 || fixed.smem_len == 0 ||
             variable.red.length == 0 || variable.green.length == 0 ||
@@ -874,9 +918,22 @@ struct Framebuffer {
     }
 
     void restore() {
-        if (ready && backup != NULL && memory != NULL) {
-            memcpy(memory, backup, length);
-            msync(memory, length, MS_SYNC);
+        if (!ready || backup == NULL || memory == NULL) return;
+        if (fd >= 0) {
+            fb_var_screeninfo original = variable;
+            original.activate = FB_ACTIVATE_NOW;
+            if (ioctl(fd, FBIOPUT_VSCREENINFO, &original) != 0) {
+                print_error("restore framebuffer mode", devicePath);
+            }
+            original = variable;
+            original.activate = FB_ACTIVATE_NOW;
+            if (ioctl(fd, FBIOPAN_DISPLAY, &original) != 0) {
+                print_error("restore framebuffer layer", devicePath);
+            }
+        }
+        memcpy(memory, backup, length);
+        if (msync(memory, length, MS_SYNC) != 0 && errno != EINVAL) {
+            print_error("sync restored framebuffer", devicePath);
         }
     }
 
@@ -907,6 +964,8 @@ struct Framebuffer {
         if (bytesPerPixel == 2) {
             uint16_t pixelValue = static_cast<uint16_t>(value);
             memcpy(memory + offset, &pixelValue, sizeof(pixelValue));
+        } else if (bytesPerPixel == 3) {
+            memcpy(memory + offset, &value, 3);
         } else {
             memcpy(memory + offset, &value, sizeof(value));
         }
@@ -968,6 +1027,10 @@ struct Framebuffer {
                 uint16_t *row = reinterpret_cast<uint16_t *>(memory + offset);
                 uint16_t pixelValue = static_cast<uint16_t>(value);
                 for (size_t xx = 0; xx < count; ++xx) row[xx] = pixelValue;
+            } else if (bytesPerPixel == 3) {
+                for (size_t xx = 0; xx < count; ++xx) {
+                    memcpy(memory + offset + xx * 3, &value, 3);
+                }
             } else {
                 uint32_t *row = reinterpret_cast<uint32_t *>(memory + offset);
                 for (size_t xx = 0; xx < count; ++xx) row[xx] = value;
@@ -1511,11 +1574,13 @@ struct InputDevice {
     bool down;
     bool pendingTap;
     char name[128];
+    char path[PATH_MAX];
     InputDevice() : fd(-1), touch(false), keyboard(false), grabbed(false),
                     xAxis(-1), yAxis(-1), rawX(0), rawY(0), down(false), pendingTap(false) {
         memset(&xInfo, 0, sizeof(xInfo));
         memset(&yInfo, 0, sizeof(yInfo));
         memset(name, 0, sizeof(name));
+        memset(path, 0, sizeof(path));
     }
 };
 
@@ -1613,6 +1678,7 @@ static bool open_input_devices(const char *directory, std::vector<InputDevice> &
         device.yInfo = yInfo;
         ioctl(fd, EVIOCGNAME(sizeof(device.name)), device.name);
         device.name[sizeof(device.name) - 1] = '\0';
+        snprintf(device.path, sizeof(device.path), "%s", path);
         if (grabDevices) {
             if (ioctl(fd, EVIOCGRAB, 1) == 0) {
                 device.grabbed = true;
@@ -2270,6 +2336,742 @@ static int run_framebuffer_session(const char *root, const char *shell,
     return 1;
 }
 
+static bool write_u16_be(int fd, uint16_t value) {
+    unsigned char bytes[2];
+    bytes[0] = static_cast<unsigned char>((value >> 8) & 0xff);
+    bytes[1] = static_cast<unsigned char>(value & 0xff);
+    return write_all(fd, bytes, sizeof(bytes));
+}
+
+static bool write_auth_field(int fd, const void *data, size_t length) {
+    if (length > 65535 || !write_u16_be(fd, static_cast<uint16_t>(length))) {
+        return false;
+    }
+    return length == 0 || write_all(fd, data, length);
+}
+
+static bool create_xauthority(const char *root, char *absolutePath,
+                              size_t absolutePathSize) {
+    char path[PATH_MAX];
+    if (!make_path(path, sizeof(path), root, "tmp/ubuntu-loader.Xauthority")) {
+        fprintf(stderr, "[ubuntu-loader] Xauthority path too long\n");
+        return false;
+    }
+    char hostname[256];
+    memset(hostname, 0, sizeof(hostname));
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0) {
+        print_error("gethostname", NULL);
+        return false;
+    }
+    int randomFd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (randomFd < 0) {
+        print_error("open /dev/urandom", NULL);
+        return false;
+    }
+    unsigned char cookie[16];
+    size_t randomRead = 0;
+    while (randomRead < sizeof(cookie)) {
+        ssize_t count = read(randomFd, cookie + randomRead,
+                             sizeof(cookie) - randomRead);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            close(randomFd);
+            fprintf(stderr, "[ubuntu-loader] Cannot generate Xauthority cookie\n");
+            return false;
+        }
+        randomRead += static_cast<size_t>(count);
+    }
+    close(randomFd);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        print_error("create Xauthority", path);
+        return false;
+    }
+    const char display[] = "0";
+    const char mechanism[] = "MIT-MAGIC-COOKIE-1";
+    bool ok = write_u16_be(fd, 256) &&
+              write_auth_field(fd, hostname, strlen(hostname)) &&
+              write_auth_field(fd, display, sizeof(display) - 1) &&
+              write_auth_field(fd, mechanism, sizeof(mechanism) - 1) &&
+              write_auth_field(fd, cookie, sizeof(cookie));
+    if (fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    memset(cookie, 0, sizeof(cookie));
+    if (!ok) {
+        unlink(path);
+        fprintf(stderr, "[ubuntu-loader] Cannot write Xauthority file\n");
+        return false;
+    }
+    if (chmod(path, 0600) != 0) {
+        print_error("chmod Xauthority", path);
+        unlink(path);
+        return false;
+    }
+    if (strlen(path) + 1 > absolutePathSize) {
+        unlink(path);
+        fprintf(stderr, "[ubuntu-loader] Xauthority path buffer too small\n");
+        return false;
+    }
+    strcpy(absolutePath, path);
+    return true;
+}
+
+static bool write_xorg_config(const char *root,
+                              const std::vector<InputDevice> &inputs,
+                              const TouchTransform &transform,
+                              const Framebuffer &fb) {
+    char configPath[PATH_MAX];
+    if (!make_path(configPath, sizeof(configPath), root,
+                   "tmp/ubuntu-loader-xorg.conf")) {
+        fprintf(stderr, "[ubuntu-loader] Xorg config path too long\n");
+        return false;
+    }
+    FILE *file = fopen(configPath, "w");
+    if (file == NULL) {
+        print_error("create Xorg config", configPath);
+        return false;
+    }
+    int depth = fb.variable.bits_per_pixel == 16 ? 16 : 24;
+    bool ok = true;
+    ok = ok && fprintf(file,
+        "Section \"ServerFlags\"\n"
+        "    Option \"AutoAddDevices\" \"false\"\n"
+        "    Option \"AutoEnableDevices\" \"false\"\n"
+        "    Option \"AllowMouseOpenFail\" \"true\"\n"
+        "    Option \"DontVTSwitch\" \"true\"\n"
+        "    Option \"DontZap\" \"true\"\n"
+        "    Option \"BlankTime\" \"0\"\n"
+        "    Option \"StandbyTime\" \"0\"\n"
+        "    Option \"SuspendTime\" \"0\"\n"
+        "    Option \"OffTime\" \"0\"\n"
+        "EndSection\n\n"
+        "Section \"Device\"\n"
+        "    Identifier \"MTKFramebuffer\"\n"
+        "    Driver \"fbdev\"\n"
+        "    Option \"fbdev\" \"%s\"\n"
+        "    Option \"ShadowFB\" \"true\"\n"
+        "EndSection\n\n"
+        "Section \"Monitor\"\n"
+        "    Identifier \"MTKPanel\"\n"
+        "EndSection\n\n"
+        "Section \"Screen\"\n"
+        "    Identifier \"UbuntuScreen\"\n"
+        "    Device \"MTKFramebuffer\"\n"
+        "    Monitor \"MTKPanel\"\n"
+        "    DefaultDepth %d\n"
+        "EndSection\n\n"
+        "Section \"ServerLayout\"\n"
+        "    Identifier \"UbuntuRecoveryLayout\"\n"
+        "    Screen \"UbuntuScreen\"\n",
+        fb.devicePath, depth) > 0;
+
+    bool corePointerWritten = false;
+    bool coreKeyboardWritten = false;
+    for (size_t i = 0; ok && i < inputs.size(); ++i) {
+        const InputDevice &device = inputs[i];
+        if (device.fd < 0 || (!device.touch && !device.keyboard)) continue;
+        char identifier[32];
+        snprintf(identifier, sizeof(identifier), "InputDevice%lu",
+                 static_cast<unsigned long>(i));
+        if (fprintf(file,
+            "    InputDevice \"%s\" \"%s\"\n",
+            identifier,
+            device.touch && !corePointerWritten ? "CorePointer" :
+            device.keyboard && !coreKeyboardWritten ? "CoreKeyboard" :
+            "SendCoreEvents") < 0) {
+            ok = false;
+            break;
+        }
+        if (device.touch && !corePointerWritten) corePointerWritten = true;
+        if (device.keyboard && !coreKeyboardWritten) coreKeyboardWritten = true;
+    }
+    ok = ok && fprintf(file, "EndSection\n\n") > 0;
+
+    for (size_t i = 0; ok && i < inputs.size(); ++i) {
+        const InputDevice &device = inputs[i];
+        if (device.fd < 0 || (!device.touch && !device.keyboard)) continue;
+        char identifier[32];
+        snprintf(identifier, sizeof(identifier), "InputDevice%lu",
+                 static_cast<unsigned long>(i));
+        ok = fprintf(file,
+            "Section \"InputDevice\"\n"
+            "    Identifier \"%s\"\n"
+            "    Driver \"evdev\"\n"
+            "    Option \"Device\" \"%s\"\n"
+            "    Option \"GrabDevice\" \"true\"\n",
+            identifier, device.path) > 0;
+        if (ok && device.touch) {
+            ok = fprintf(file,
+                "    Option \"Calibration\" \"%d %d %d %d\"\n",
+                device.xInfo.minimum, device.xInfo.maximum,
+                device.yInfo.minimum, device.yInfo.maximum) > 0;
+            if (ok && transform.swapXY)
+                ok = fprintf(file, "    Option \"SwapAxes\" \"true\"\n") > 0;
+            if (ok && transform.flipX)
+                ok = fprintf(file, "    Option \"InvertX\" \"true\"\n") > 0;
+            if (ok && transform.flipY)
+                ok = fprintf(file, "    Option \"InvertY\" \"true\"\n") > 0;
+        }
+        ok = ok && fprintf(file, "EndSection\n\n") > 0;
+    }
+    if (ferror(file)) ok = false;
+    if (fclose(file) != 0) ok = false;
+    if (!ok) {
+        unlink(configPath);
+        fprintf(stderr, "[ubuntu-loader] Cannot generate Xorg configuration\n");
+        return false;
+    }
+    if (chmod(configPath, 0644) != 0) {
+        print_error("chmod Xorg config", configPath);
+        unlink(configPath);
+        return false;
+    }
+    return true;
+}
+
+static bool desktop_dependencies(const char *root, const char *desktopSession,
+                                 char *xorgBinary, size_t xorgBinarySize) {
+    const char *xorgCandidates[] = {
+        "/usr/lib/xorg/Xorg",
+        "/usr/bin/Xorg",
+        "/usr/bin/X"
+    };
+    xorgBinary[0] = '\0';
+    for (size_t i = 0; i < sizeof(xorgCandidates) / sizeof(xorgCandidates[0]); ++i) {
+        char path[PATH_MAX];
+        if (!make_path(path, sizeof(path), root, xorgCandidates[i])) continue;
+        if (access(path, X_OK) == 0) {
+            if (strlen(xorgCandidates[i]) + 1 > xorgBinarySize) return false;
+            strcpy(xorgBinary, xorgCandidates[i]);
+            break;
+        }
+    }
+    if (xorgBinary[0] == '\0') {
+        fprintf(stderr, "[ubuntu-loader] Xorg not found; install xserver-xorg-core\n");
+        return false;
+    }
+    const char *required[] = {
+        "usr/lib/xorg/modules/drivers/fbdev_drv.so",
+        "usr/lib/xorg/modules/input/evdev_drv.so",
+        "usr/bin/dbus-run-session",
+        "usr/share/X11/xkb"
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
+        char path[PATH_MAX];
+        if (!make_path(path, sizeof(path), root, required[i]) || access(path, R_OK) != 0) {
+            fprintf(stderr, "[ubuntu-loader] Missing desktop dependency: /%s\n",
+                    required[i]);
+            return false;
+        }
+    }
+    if (!check_arm64_elf(root, "usr/lib/xorg/modules/drivers/fbdev_drv.so") ||
+        !check_arm64_elf(root, "usr/lib/xorg/modules/input/evdev_drv.so")) {
+        fprintf(stderr, "[ubuntu-loader] Xorg fbdev/evdev modules are not ARM64 ELF\n");
+        return false;
+    }
+    const char *sessionBinary = strcmp(desktopSession, "xfce") == 0
+        ? "usr/bin/startxfce4" : "usr/bin/openbox-session";
+    char sessionPath[PATH_MAX];
+    if (!make_path(sessionPath, sizeof(sessionPath), root, sessionBinary) ||
+        access(sessionPath, X_OK) != 0) {
+        fprintf(stderr, "[ubuntu-loader] Missing desktop session: /%s\n",
+                sessionBinary);
+        return false;
+    }
+    if (strcmp(desktopSession, "xfce") == 0) {
+        const char *xfceBinaries[] = {
+            "usr/bin/xfconf-query",
+            "usr/bin/xfce4-session",
+            "usr/bin/xfce4-panel",
+            "usr/bin/xfdesktop",
+            "usr/bin/xfwm4",
+            "usr/bin/thunar"
+        };
+        for (size_t i = 0; i < sizeof(xfceBinaries) / sizeof(xfceBinaries[0]); ++i) {
+            char xfcePath[PATH_MAX];
+            if (!make_path(xfcePath, sizeof(xfcePath), root, xfceBinaries[i]) ||
+                access(xfcePath, X_OK) != 0) {
+                fprintf(stderr, "[ubuntu-loader] Missing XFCE component: /%s\n", xfceBinaries[i]);
+                return false;
+            }
+        }
+    } else {
+        char openboxPath[PATH_MAX];
+        if (!make_path(openboxPath, sizeof(openboxPath), root, "usr/bin/openbox") ||
+            access(openboxPath, X_OK) != 0) {
+            fprintf(stderr, "[ubuntu-loader] Missing Openbox executable: /usr/bin/openbox\n");
+            return false;
+        }
+    }
+    if (!check_arm64_elf(root, xorgBinary + 1)) {
+        fprintf(stderr, "[ubuntu-loader] Xorg is not a usable ARM64 executable\n");
+        return false;
+    }
+    return true;
+}
+
+static void print_xorg_log_tail(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "[ubuntu-loader] Xorg log unavailable: %s\n", path);
+        return;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return;
+    }
+    long end = ftell(file);
+    if (end < 0) {
+        fclose(file);
+        return;
+    }
+    long start = end > 12288 ? end - 12288 : 0;
+    if (fseek(file, start, SEEK_SET) != 0) {
+        fclose(file);
+        return;
+    }
+    fprintf(stderr, "[ubuntu-loader] Xorg log tail (%s):\n", path);
+    unsigned char buffer[1024];
+    size_t count;
+    while ((count = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        fwrite(buffer, 1, count, stderr);
+    }
+    if (end > 0) fprintf(stderr, "\n[ubuntu-loader] End of Xorg log\n");
+    fclose(file);
+}
+
+static bool wait_for_x_server(pid_t xorgPid, const char *socketPath,
+                             int timeoutMs, bool *alreadyReaped,
+                             int *earlyStatus) {
+    const int intervalMs = 100;
+    int elapsed = 0;
+    *alreadyReaped = false;
+    while (elapsed < timeoutMs) {
+        int status = 0;
+        pid_t result = waitpid(xorgPid, &status, WNOHANG);
+        if (result == xorgPid) {
+            *alreadyReaped = true;
+            *earlyStatus = status;
+            fprintf(stderr, "[ubuntu-loader] Xorg exited during startup\n");
+            return false;
+        }
+        if (result < 0 && errno != EINTR) {
+            print_error("wait Xorg startup", NULL);
+            return false;
+        }
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_un address;
+            memset(&address, 0, sizeof(address));
+            address.sun_family = AF_UNIX;
+            if (strlen(socketPath) >= sizeof(address.sun_path)) {
+                close(fd);
+                fprintf(stderr, "[ubuntu-loader] X socket path is too long\n");
+                return false;
+            }
+            strcpy(address.sun_path, socketPath);
+            if (connect(fd, reinterpret_cast<struct sockaddr *>(&address),
+                        sizeof(address)) == 0) {
+                close(fd);
+                return true;
+            }
+            close(fd);
+        }
+        usleep(intervalMs * 1000);
+        elapsed += intervalMs;
+    }
+    fprintf(stderr, "[ubuntu-loader] Timed out waiting for Xorg display :0\n");
+    return false;
+}
+
+static int wait_child(pid_t child, int *status) {
+    pid_t result;
+    do {
+        result = waitpid(child, status, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == child ? 0 : -1;
+}
+
+static void terminate_child_process(pid_t child) {
+    if (child <= 0) return;
+    int status = 0;
+    pid_t result = waitpid(child, &status, WNOHANG);
+    if (result == child || (result < 0 && errno == ECHILD)) return;
+    if (kill(child, SIGTERM) != 0 && errno != ESRCH) {
+        print_error("terminate child", NULL);
+    }
+    for (int i = 0; i < 30; ++i) {
+        result = waitpid(child, &status, WNOHANG);
+        if (result == child || (result < 0 && errno == ECHILD)) return;
+        usleep(100000);
+    }
+    kill(child, SIGKILL);
+    wait_child(child, &status);
+}
+
+static void terminate_xorg(pid_t xorgPid, bool alreadyReaped) {
+    if (xorgPid <= 0 || alreadyReaped) return;
+    terminate_child_process(xorgPid);
+}
+
+static int desktop_child_exec(const char *root, const char *xorgBinary,
+                              const char *desktopSession, bool showKeyboard,
+                              const char *authorityPath, pid_t expectedParent) {
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != expectedParent) {
+        _exit(125);
+    }
+    reset_child_signals();
+    if (setsid() < 0) _exit(126);
+    if (chdir(root) != 0 || chroot(".") != 0 || chdir("/") != 0) {
+        fprintf(stderr, "[ubuntu-loader] Desktop chroot failed: %s\n", strerror(errno));
+        _exit(126);
+    }
+    clearenv();
+    setenv("HOME", "/root", 1);
+    setenv("USER", "root", 1);
+    setenv("LOGNAME", "root", 1);
+    setenv("SHELL", "/bin/bash", 1);
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("LANG", "C.UTF-8", 1);
+    setenv("LC_ALL", "C.UTF-8", 1);
+    setenv("DISPLAY", ":0", 1);
+    setenv("XAUTHORITY", authorityPath, 1);
+    setenv("XDG_SESSION_TYPE", "x11", 1);
+    setenv("XDG_CURRENT_DESKTOP", strcmp(desktopSession, "xfce") == 0 ? "XFCE" : "OPENBOX", 1);
+    setenv("XDG_SESSION_DESKTOP", desktopSession, 1);
+    setenv("XDG_RUNTIME_DIR", "/tmp/ubuntu-loader-runtime", 1);
+    setenv("XDG_CONFIG_HOME", "/tmp/ubuntu-loader-xdg", 1);
+    setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    setenv("GALLIUM_DRIVER", "llvmpipe", 1);
+    setenv("QT_QPA_PLATFORM", "xcb", 1);
+    setenv("GDK_BACKEND", "x11", 1);
+    umask(022);
+    mkdir("/tmp/.X11-unix", 01777);
+    chmod("/tmp/.X11-unix", 01777);
+    mkdir("/tmp/ubuntu-loader-runtime", 0700);
+    chmod("/tmp/ubuntu-loader-runtime", 0700);
+    if (strcmp(desktopSession, "xfce") == 0) {
+        mkdir("/tmp/ubuntu-loader-xdg", 0700);
+        mkdir("/tmp/ubuntu-loader-xdg/xfce4", 0700);
+        mkdir("/tmp/ubuntu-loader-xdg/xfce4/xfconf", 0700);
+        mkdir("/tmp/ubuntu-loader-xdg/xfce4/xfconf/xfce-perchannel-xml", 0700);
+        FILE *profile = fopen("/tmp/ubuntu-loader-xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml", "w");
+        if (profile != NULL) {
+            fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                  "<channel name=\"xfwm4\" version=\"1.0\">\n"
+                  "<property name=\"general\" type=\"empty\">\n"
+                  "<property name=\"use_compositing\" type=\"bool\" value=\"false\"/>\n"
+                  "</property>\n</channel>\n", profile);
+            fclose(profile);
+        }
+    }
+    unlink("/tmp/.X11-unix/X0");
+    unlink("/tmp/.X0-lock");
+
+    pid_t supervisorPid = getpid();
+    pid_t xorgPid = fork();
+    if (xorgPid < 0) {
+        print_error("fork Xorg", NULL);
+        _exit(1);
+    }
+    if (xorgPid == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != supervisorPid) _exit(125);
+        reset_child_signals();
+        char *args[] = {
+            const_cast<char *>("Xorg"),
+            const_cast<char *>(":0"),
+            const_cast<char *>("-config"),
+            const_cast<char *>("/tmp/ubuntu-loader-xorg.conf"),
+            const_cast<char *>("-auth"),
+            const_cast<char *>("/tmp/ubuntu-loader.Xauthority"),
+            const_cast<char *>("-nolisten"),
+            const_cast<char *>("tcp"),
+            const_cast<char *>("-noreset"),
+            const_cast<char *>("-novtswitch"),
+            const_cast<char *>("-logverbose"),
+            const_cast<char *>("6"),
+            const_cast<char *>("-logfile"),
+            const_cast<char *>("/tmp/ubuntu-loader-xorg.log"),
+            NULL
+        };
+        execv(xorgBinary, args);
+        fprintf(stderr, "[ubuntu-loader] exec Xorg failed: %s\n", strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    const char *socketPath = "/tmp/.X11-unix/X0";
+    bool xorgAlreadyReaped = false;
+    int xorgEarlyStatus = 0;
+    if (!wait_for_x_server(xorgPid, socketPath, 30000,
+                           &xorgAlreadyReaped, &xorgEarlyStatus)) {
+        print_xorg_log_tail("/tmp/ubuntu-loader-xorg.log");
+        terminate_xorg(xorgPid, xorgAlreadyReaped);
+        _exit(1);
+    }
+    fprintf(stderr, "[ubuntu-loader] Xorg display :0 is ready\n");
+
+    if (showKeyboard && access("/usr/bin/onboard", X_OK) != 0) {
+        fprintf(stderr, "[ubuntu-loader] Onboard is not installed; touch keyboard will not be available\n");
+    }
+
+    pid_t sessionPid = fork();
+    if (sessionPid < 0) {
+        print_error("fork desktop session", NULL);
+        terminate_xorg(xorgPid, false);
+        _exit(1);
+    }
+    if (sessionPid == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != supervisorPid) _exit(125);
+        reset_child_signals();
+        if (strcmp(desktopSession, "xfce") == 0) {
+            const char *script = showKeyboard && access("/usr/bin/onboard", X_OK) == 0
+                ? "onboard & onboard_pid=$!; /usr/bin/startxfce4; status=$?; kill $onboard_pid 2>/dev/null; wait $onboard_pid 2>/dev/null; exit $status"
+                : "exec /usr/bin/startxfce4";
+            char *args[] = {
+                const_cast<char *>("dbus-run-session"),
+                const_cast<char *>("--"),
+                const_cast<char *>("/bin/sh"),
+                const_cast<char *>("-c"),
+                const_cast<char *>(script),
+                NULL
+            };
+            execv("/usr/bin/dbus-run-session", args);
+        } else {
+            const char *script = showKeyboard && access("/usr/bin/onboard", X_OK) == 0
+                ? "onboard & onboard_pid=$!; /usr/bin/openbox-session; status=$?; kill $onboard_pid 2>/dev/null; wait $onboard_pid 2>/dev/null; exit $status"
+                : "exec /usr/bin/openbox-session";
+            char *args[] = {
+                const_cast<char *>("dbus-run-session"),
+                const_cast<char *>("--"),
+                const_cast<char *>("/bin/sh"),
+                const_cast<char *>("-c"),
+                const_cast<char *>(script),
+                NULL
+            };
+            execv("/usr/bin/dbus-run-session", args);
+        }
+        fprintf(stderr, "[ubuntu-loader] exec desktop session failed: %s\n", strerror(errno));
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+
+    int sessionStatus = 0;
+    if (wait_child(sessionPid, &sessionStatus) != 0) {
+        print_error("wait desktop session", NULL);
+        print_xorg_log_tail("/tmp/ubuntu-loader-xorg.log");
+        terminate_xorg(xorgPid, false);
+        _exit(1);
+    }
+    if (!WIFEXITED(sessionStatus) || WEXITSTATUS(sessionStatus) != 0) {
+        print_xorg_log_tail("/tmp/ubuntu-loader-xorg.log");
+    }
+    terminate_xorg(xorgPid, false);
+    if (WIFEXITED(sessionStatus)) _exit(WEXITSTATUS(sessionStatus));
+    if (WIFSIGNALED(sessionStatus)) _exit(128 + WTERMSIG(sessionStatus));
+    _exit(1);
+}
+
+static int check_desktop_preflight(const char *root, const char *fbPath,
+                                   const char *inputPath,
+                                   const char *desktopSession,
+                                   bool showKeyboard) {
+    char xorgBinary[PATH_MAX];
+    if (!desktop_dependencies(root, desktopSession, xorgBinary, sizeof(xorgBinary))) {
+        return 1;
+    }
+    if (!setup_mounts(root)) {
+        cleanup_mounts(root);
+        return 1;
+    }
+    Framebuffer fb;
+    if (!fb.open_device(fbPath, false)) {
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    std::vector<InputDevice> inputs;
+    if (!open_input_devices(inputPath, inputs, false)) {
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    bool hasTouch = false;
+    bool hasKeyboard = false;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (inputs[i].touch) hasTouch = true;
+        if (inputs[i].keyboard) hasKeyboard = true;
+    }
+    printf("[ubuntu-loader] Xorg: %s\n", xorgBinary);
+    printf("[ubuntu-loader] Framebuffer: %s\n", fb.devicePath);
+    printf("[ubuntu-loader] Geometry: %ux%u virtual=%ux%u rotate=%u bpp=%u stride=%u memory=%u\n",
+           fb.variable.xres, fb.variable.yres,
+           fb.variable.xres_virtual, fb.variable.yres_virtual,
+           fb.variable.rotate, fb.variable.bits_per_pixel,
+           fb.fixed.line_length, fb.fixed.smem_len);
+    printf("[ubuntu-loader] Touchscreen: %s\n", hasTouch ? "detected" : "not detected");
+    printf("[ubuntu-loader] Hardware keyboard: %s\n", hasKeyboard ? "detected" : "not detected");
+    bool onboardAvailable = access((std::string(root) + "/usr/bin/onboard").c_str(), X_OK) == 0;
+    printf("[ubuntu-loader] Onboard: %s\n", onboardAvailable ? "available" : "not installed");
+    printf("[ubuntu-loader] Renderer: CPU software rendering\n");
+    printf("[ubuntu-loader] Shared memory: tmpfs /dev/shm (128 MiB limit)\n");
+    printf("[ubuntu-loader] Xorg mode: fbdev, no VT dependency\n");
+    close_inputs(inputs);
+    fb.close_device();
+    bool clean = cleanup_mounts(root);
+    if (!clean) return 1;
+    if (!hasTouch && !hasKeyboard) {
+        fprintf(stderr, "[ubuntu-loader] No touchscreen or keyboard input device found\n");
+        return 1;
+    }
+    if (hasTouch && !hasKeyboard && showKeyboard && !onboardAvailable) {
+        fprintf(stderr, "[ubuntu-loader] Touch-only desktop requires Onboard; install package onboard\n");
+        return 1;
+    }
+    if (!showKeyboard && !hasKeyboard) {
+        fprintf(stderr, "[ubuntu-loader] On-screen keyboard is disabled and no hardware keyboard is detected\n");
+    }
+    printf("[ubuntu-loader] Desktop preflight successful; TWRP was not stopped and the display was not changed\n");
+    return 0;
+}
+
+static int run_desktop_session(const char *root, const char *fbPath,
+                               const char *inputPath, pid_t recoveryPid,
+                               const TouchTransform &transform,
+                               const char *desktopSession, bool showKeyboard) {
+    if (recoveryPid <= 1) {
+        fprintf(stderr, "[ubuntu-loader] Desktop mode requires --freeze-pid auto or a verified PID\n");
+        return 2;
+    }
+    char xorgBinary[PATH_MAX];
+    if (!desktop_dependencies(root, desktopSession, xorgBinary, sizeof(xorgBinary))) {
+        fprintf(stderr,
+            "[ubuntu-loader] Install: xserver-xorg-core xserver-xorg-video-fbdev "
+            "xserver-xorg-input-evdev dbus-x11 xauth xfce4-session xfce4-panel "
+            "xfdesktop4 xfwm4 xfce4-settings xfconf thunar xfce4-terminal "
+            "fonts-dejavu-core xfonts-base onboard\n");
+        return 1;
+    }
+    if (!install_signal_handlers() || !setup_mounts(root)) {
+        cleanup_mounts(root);
+        return 1;
+    }
+    Framebuffer fb;
+    if (!fb.open_device(fbPath)) {
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    std::vector<InputDevice> inputs;
+    if (!open_input_devices(inputPath, inputs, false)) {
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    bool hasTouch = false;
+    bool hasKeyboard = false;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (inputs[i].touch) hasTouch = true;
+        if (inputs[i].keyboard) hasKeyboard = true;
+    }
+    if (!hasTouch && !hasKeyboard) {
+        fprintf(stderr, "[ubuntu-loader] No touchscreen or hardware keyboard detected\n");
+        close_inputs(inputs);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    bool onboardAvailable = access((std::string(root) + "/usr/bin/onboard").c_str(), X_OK) == 0;
+    if (hasTouch && !hasKeyboard && showKeyboard && !onboardAvailable) {
+        fprintf(stderr, "[ubuntu-loader] Touch-only desktop requires Onboard; install package onboard\n");
+        close_inputs(inputs);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    if (!hasTouch) {
+        fprintf(stderr, "[ubuntu-loader] No touchscreen detected; desktop will require a hardware keyboard\n");
+    }
+    if (!write_xorg_config(root, inputs, transform, fb)) {
+        close_inputs(inputs);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    close_inputs(inputs);
+
+    char authorityPath[PATH_MAX];
+    if (!create_xauthority(root, authorityPath, sizeof(authorityPath))) {
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    if (!freeze_recovery(recoveryPid)) {
+        char path[PATH_MAX];
+        if (make_path(path, sizeof(path), root, "tmp/ubuntu-loader-xorg.conf")) unlink(path);
+        if (make_path(path, sizeof(path), root, "tmp/ubuntu-loader.Xauthority")) unlink(path);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    if (!fb.snapshot()) {
+        fprintf(stderr, "[ubuntu-loader] Cannot preserve original TWRP framebuffer\n");
+        kill(recoveryPid, SIGCONT);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    pid_t watchdog = start_recovery_watchdog(recoveryPid, fb.memory,
+                                             fb.backup, fb.length);
+    if (watchdog < 0) {
+        fb.restore();
+        kill(recoveryPid, SIGCONT);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+
+    fprintf(stderr, "[ubuntu-loader] Starting Xorg fbdev desktop on %ux%u %ubpp\n",
+            fb.variable.xres, fb.variable.yres, fb.variable.bits_per_pixel);
+    fprintf(stderr, "[ubuntu-loader] Renderer: Xorg fbdev with CPU software rendering\n");
+    fprintf(stderr, "[ubuntu-loader] Mali acceleration is not enabled; no matching Linux Mesa/DRM stack was verified\n");
+    pid_t loaderPid = getpid();
+    pid_t child = fork();
+    if (child < 0) {
+        print_error("fork desktop supervisor", NULL);
+        fb.restore();
+        kill(recoveryPid, SIGCONT);
+        stop_watchdog(watchdog);
+        fb.close_device();
+        cleanup_mounts(root);
+        return 1;
+    }
+    if (child == 0) {
+        munmap(fb.memory, fb.length);
+        close(fb.fd);
+        desktop_child_exec(root, xorgBinary, desktopSession, showKeyboard && hasTouch,
+                           "/tmp/ubuntu-loader.Xauthority", loaderPid);
+        _exit(126);
+    }
+    gChildPid = static_cast<sig_atomic_t>(child);
+    int status = 0;
+    int waitResult = wait_child(child, &status);
+    gChildPid = -1;
+    fb.restore();
+    fb.close_device();
+    char path[PATH_MAX];
+    if (make_path(path, sizeof(path), root, "tmp/ubuntu-loader-xorg.conf")) unlink(path);
+    if (make_path(path, sizeof(path), root, "tmp/ubuntu-loader.Xauthority")) unlink(path);
+    bool mountClean = cleanup_mounts(root);
+    kill(recoveryPid, SIGCONT);
+    stop_watchdog(watchdog);
+    fprintf(stderr, "[ubuntu-loader] Framebuffer restored and TWRP resumed\n");
+    if (waitResult != 0 || !mountClean) return 1;
+    if (gCaughtSignal != 0) return 128 + gCaughtSignal;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+}
+
 static int run_adb_session(const char *root, const char *shell,
                            int argc, char **argv, int commandIndex) {
     bool stdinTty = isatty(STDIN_FILENO) != 0;
@@ -2363,11 +3165,14 @@ static pid_t find_recovery_pid(void) {
 static void show_help(const char *program) {
     printf("Ubuntu ARM64 TWRP Loader %s\n\n", kVersion);
     printf("Usage:\n");
-    printf("  %s [--rootfs PATH] [--display adb|fb] [options] [-- COMMAND [ARG...]]\n\n", program);
+    printf("  %s [--rootfs PATH] [--display adb|fb|desktop] [options]\n\n", program);
     printf("Options:\n");
     printf("  --rootfs PATH          Ubuntu RootFS directory or mounted ext4 mountpoint\n");
     printf("  --display adb          Interactive shell through ADB PTY (default)\n");
     printf("  --display fb           Draw Ubuntu terminal directly to framebuffer\n");
+    printf("  --display desktop      Start Ubuntu Xorg desktop on the framebuffer\n");
+    printf("                           Requires Xorg fbdev/evdev, XFCE or Openbox, dbus and fonts in RootFS\n");
+    printf("  --desktop-session xfce|openbox  Desktop session (default xfce)\n");
     printf("  --fbdev PATH           Framebuffer device (default /dev/graphics/fb0)\n");
     printf("  --screen-rotate DEG    Rotate drawn UI by 0, 90, 180 or 270 degrees\n");
     printf("  --input-dir PATH       Input event directory (default /dev/input)\n");
@@ -2376,14 +3181,17 @@ static void show_help(const char *program) {
     printf("  --touch-swap-xy        Swap touch X/Y axes\n");
     printf("  --touch-flip-x         Flip horizontal touch coordinate\n");
     printf("  --touch-flip-y         Flip vertical touch coordinate\n");
-    printf("  --no-soft-keyboard     Disable the on-screen touch keyboard\n");
+    printf("  --no-soft-keyboard     Disable the framebuffer/desktop on-screen keyboard\n");
     printf("  --check                Validate RootFS and mount namespace\n");
+    printf("  --check-desktop        Preflight Xorg, framebuffer and input without stopping TWRP\n");
     printf("  --help                 Show this help\n");
     printf("  --version              Show version\n\n");
     printf("Examples:\n");
     printf("  adb shell -tt %s --rootfs /data/ubuntu\n", program);
     printf("  %s --rootfs /mnt/ubuntu --check\n", program);
     printf("  adb shell -tt %s --rootfs /data/ubuntu --display fb --freeze-pid auto --screen-rotate 270\n", program);
+    printf("  %s --rootfs /mnt/ubuntu --check-desktop --desktop-session xfce\n", program);
+    printf("  adb shell -tt %s --rootfs /data/ubuntu --display desktop --desktop-session xfce --freeze-pid auto\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2397,9 +3205,12 @@ int main(int argc, char **argv) {
     const char *inputPath = kDefaultInputDirectory;
     bool rootSpecified = false;
     bool checkOnly = false;
+    bool checkDesktopOnly = false;
     bool probeDisplay = false;
     bool showKeyboard = true;
     bool framebufferMode = false;
+    bool desktopMode = false;
+    const char *desktopSession = "xfce";
     int screenRotation = 0;
     int commandIndex = -1;
     pid_t recoveryPid = -1;
@@ -2416,6 +3227,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--check") == 0) {
             checkOnly = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--check-desktop") == 0) {
+            checkDesktopOnly = true;
             continue;
         }
         if (strcmp(argv[i], "--probe-display") == 0) {
@@ -2440,7 +3255,8 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--rootfs") == 0 || strcmp(argv[i], "--fbdev") == 0 ||
             strcmp(argv[i], "--input-dir") == 0 || strcmp(argv[i], "--display") == 0 ||
-            strcmp(argv[i], "--freeze-pid") == 0 || strcmp(argv[i], "--screen-rotate") == 0) {
+            strcmp(argv[i], "--freeze-pid") == 0 || strcmp(argv[i], "--screen-rotate") == 0 ||
+            strcmp(argv[i], "--desktop-session") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "[ubuntu-loader] Option requires a value: %s\n", argv[i]);
                 return 2;
@@ -2455,8 +3271,9 @@ int main(int argc, char **argv) {
             } else if (strcmp(option, "--input-dir") == 0) {
                 inputPath = value;
             } else if (strcmp(option, "--display") == 0) {
-                if (strcmp(value, "fb") == 0) framebufferMode = true;
-                else if (strcmp(value, "adb") == 0) framebufferMode = false;
+                if (strcmp(value, "fb") == 0) { framebufferMode = true; desktopMode = false; }
+                else if (strcmp(value, "adb") == 0) { framebufferMode = false; desktopMode = false; }
+                else if (strcmp(value, "desktop") == 0) { framebufferMode = false; desktopMode = true; }
                 else {
                     fprintf(stderr, "[ubuntu-loader] Invalid display mode: %s\n", value);
                     return 2;
@@ -2470,6 +3287,12 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 screenRotation = static_cast<int>(parsed);
+            } else if (strcmp(option, "--desktop-session") == 0) {
+                if (strcmp(value, "xfce") != 0 && strcmp(value, "openbox") != 0) {
+                    fprintf(stderr, "[ubuntu-loader] Invalid desktop session: %s\n", value);
+                    return 2;
+                }
+                desktopSession = value;
             } else if (strcmp(option, "--freeze-pid") == 0) {
                 if (strcmp(value, "auto") == 0) {
                     recoveryPid = find_recovery_pid();
@@ -2506,14 +3329,18 @@ int main(int argc, char **argv) {
 
     if (commandIndex >= argc) commandIndex = -1;
     if (probeDisplay) {
-        if (checkOnly || commandIndex >= 0 || framebufferMode) {
-            fprintf(stderr, "[ubuntu-loader] --probe-display cannot be combined with --check, commands or --display fb\n");
+        if (checkOnly || checkDesktopOnly || commandIndex >= 0 || framebufferMode || desktopMode) {
+            fprintf(stderr, "[ubuntu-loader] --probe-display cannot be combined with checks, commands or graphical display modes\n");
             return 2;
         }
         return probe_display(fbPath, inputPath);
     }
-    if (checkOnly && commandIndex >= 0) {
-        fprintf(stderr, "[ubuntu-loader] --check cannot be combined with a command\n");
+    if ((checkOnly || checkDesktopOnly || desktopMode || framebufferMode) && commandIndex >= 0) {
+        fprintf(stderr, "[ubuntu-loader] Check or graphical display mode cannot be combined with a command\n");
+        return 2;
+    }
+    if (checkOnly && checkDesktopOnly) {
+        fprintf(stderr, "[ubuntu-loader] --check and --check-desktop are mutually exclusive\n");
         return 2;
     }
 
@@ -2534,7 +3361,18 @@ int main(int argc, char **argv) {
         printf("[ubuntu-loader] RootFS and mount namespace validation successful\n");
         return 0;
     }
+    if (checkDesktopOnly) {
+        return check_desktop_preflight(root, fbPath, inputPath, desktopSession,
+                                       showKeyboard);
+    }
 
+    if (desktopMode) {
+        if (screenRotation != 0) {
+            fprintf(stderr, "[ubuntu-loader] --screen-rotate is not applied in Xorg desktop mode; the kernel framebuffer orientation is used\n");
+        }
+        return run_desktop_session(root, fbPath, inputPath, recoveryPid,
+                                   transform, desktopSession, showKeyboard);
+    }
     if (framebufferMode) {
         return run_framebuffer_session(root, shell, argc, argv, commandIndex,
                                        fbPath, inputPath, recoveryPid,
