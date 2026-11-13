@@ -11,9 +11,8 @@ PRODUCT_CHARACTERISTICS := tablet
 PRODUCT_PACKAGES += \
     android.hardware.health@2.1-impl \
     android.hardware.health@2.1-impl.recovery \
-    android.hardware.health@2.1-service
-
-PRODUCT_PACKAGES += ubuntu-loader
+    android.hardware.health@2.1-service \
+    ubuntu-loader
 
 PRODUCT_DEFAULT_PROPERTY_OVERRIDES += \
     ro.build.product=TAB-A05-BD \
